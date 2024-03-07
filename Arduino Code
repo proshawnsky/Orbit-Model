@@ -1,0 +1,571 @@
+#include <Adafruit_PWMServoDriver.h>
+#include <Encoder.h>
+#include <stdio.h>
+
+#define ENCODER_OPTIMIZE_INTERRUPTS
+#define incHallPin A4
+// struct vector {double x, y, z;};
+// struct orbitElements {
+//   double a, e, i, raan, peri, ta, M, E, p, n;
+//   vector r;
+// };
+
+#define motor1Dir1 8 // grey 8 
+#define motor1Dir2 10 // blue 10
+#define motor1PWM 12 // yellow 12
+
+#define motor2Dir1 7 // white 7 - 9
+#define motor2Dir2 9 // purple 9 -
+#define motor2PWM 11 // green 11
+
+#define eStop 4
+#define powerRelay 6
+#define raanGate 5
+
+#define laser1Relay 43
+#define laser2Relay 41
+#define laser3Relay 39
+#define laser4Relay 37
+#define laser5Relay 35
+#define laser6Relay 33
+#define laser6Relay 31
+
+#define SERVOMIN  150 // This is the 'minimum' pulse length count (out of 4096)
+#define SERVOMAX  600 // This is the 'maximum' pulse length count (out of 4096)
+#define USMIN  600 // This is the rounded 'minimum' microsecond length based on the minimum pulse of 150
+#define USMAX  2400 // This is the rounded 'maximum' microsecond length based on the maximum pulse of 600
+#define SERVO_FREQ 50 // Analog servos run at ~50 Hz updates
+
+const float pi = 3.14159;
+
+void HandleButton();
+void HandleEncoders();
+void HandlePID();
+void CalibrateRaan();
+void CalibrateInc();
+void setDir(int, int);
+int sign(double);
+void zero();
+void HandleServoRelays(int, int);
+void HandleLaserRelays(int, int);
+void HandleServosManual(int, int);
+double MeanAnomalyToTrueAnomaly(double);
+void COEtoCart(double, double, double, double, double, double);
+double TimeToMeanAnomaly(double time);
+void HandleOrbit();
+void InitOrbit();//(orbitalElements orbit)
+void Cart2Spherical();
+void Spherical2PWM();
+
+//timing variables
+long previousTime, currentTime;
+
+//hardware/GUI inputs, 
+int disableButtonState, lastDisableButtonState, reading, currentIncHall, oldIncHall;
+String serialIn, remainingInput;
+char firstChar;
+
+//time variables
+unsigned long newTime, oldTime, timeSinceLastLCDUpdate, lastDebounceTime, debounceDelay, dt;
+
+//angle states: setpoints, current, prev, error, prev error, error derivative/integral, tolerance
+double raanSetpoint, currentRaan, raanError, raanErrorPrev, raanErrorDer, raanErrorInt, oldRaan, raanTol;
+double incSetpoint, currentInc, incError, incErrorPrev, incErrorDer, incErrorInt, oldInc, incTol;
+
+//Encoder definitions
+Encoder raanEnc(18, 19);
+Encoder incEnc(2, 3); //pins 18, 19
+
+//motors speeds
+int raanSpeed, incSpeed, incSpeedSetpoint, raanSpeedSetpoint, raanMotorMin, incMotorMin;
+
+//motor PID tuning parameters
+double tune1, raanKp, raanKi, raanKd, incKp, incKi, incKd;
+
+//servos and lasers
+Adafruit_PWMServoDriver servos = Adafruit_PWMServoDriver();
+unsigned servoCommandedID, servoCommandedPWM, laserCommanded, laserPower;
+
+//software states
+int disable, mode, raanCalibrated, incCalibrated;
+
+//Orbit
+int seconds;
+//COE
+//orbitElements orbit;
+double orbit_a, orbit_e, orbit_i, orbit_raan, orbit_peri, orbit_ta; //COE
+double orbit_E, orbit_M, orbit_n, orbit_rmag, orbit_p, orbit_mu; //supporting vars
+double orbit_rx, orbit_ry, orbit_rz; //cartesian positions
+int lastOrbitUpdateTime, orbitUpdatePeriod; //ms
+double elevation, azimuth, timeWarp;
+
+void setup() {
+
+  Serial.begin(9600);
+  pinMode(motor1Dir1, OUTPUT);
+  pinMode(motor1Dir2, OUTPUT);
+  pinMode(motor1PWM, OUTPUT);
+
+  pinMode(motor2Dir1, OUTPUT);
+  pinMode(motor2Dir2, OUTPUT);
+  pinMode(motor2PWM, OUTPUT);
+  pinMode(powerRelay, OUTPUT);
+
+  pinMode(laser1Relay, OUTPUT);
+  pinMode(laser2Relay, OUTPUT);
+  pinMode(laser3Relay, OUTPUT);
+  pinMode(laser4Relay, OUTPUT);
+  pinMode(laser5Relay, OUTPUT);
+  pinMode(laser6Relay, OUTPUT);
+
+  //modes
+  disable = 1;
+  mode = 1;
+  raanCalibrated = 0;
+  incCalibrated = 0;
+
+  //RAAN
+  currentRaan = 0;
+  raanSetpoint = 0;
+  raanSpeed = 0;
+  raanError = 0;
+  raanErrorPrev = 0;
+  raanErrorDer = 0;
+  raanErrorInt = 0;
+  raanTol = 0.5;
+  oldRaan = 0;
+  //tuning parameters
+  raanKp = 5.24;
+  raanKi = .008;
+  raanKd = 0;
+  raanMotorMin = 20;
+
+  //inc
+  currentInc = 0;
+  incSetpoint = 0;
+  incSpeed = 0;
+  incError = 0;
+  incErrorPrev = 0;
+  incErrorDer = 0;
+  incErrorInt = 0;
+  incTol = 0.2;
+  oldInc = 0;
+  //tuning parameters
+  incKp = 20;
+  incKi = .002;
+  incKd = 0;
+  incMotorMin = 20;
+
+  //time
+  lastDebounceTime = 0;
+  disableButtonState = 0;
+  lastDisableButtonState = 0;
+  debounceDelay = 10;
+  previousTime = 0;
+  currentTime = 0;
+
+  laserPower = 0; 
+  laserCommanded = 1;
+  servos.begin();
+  servos.setOscillatorFrequency(27000000);
+  servos.setPWMFreq(SERVO_FREQ);  // Analog servos run at ~50 Hz updates
+  HandleLaserRelays(1,0);
+  HandleLaserRelays(2,0);
+  HandleLaserRelays(3,0);
+  HandleLaserRelays(4,0);
+  HandleLaserRelays(5,0);
+  HandleLaserRelays(6,0);
+  HandleLaserRelays(7,0);
+
+
+  orbit_a = 5;
+  orbit_e = 0;
+  orbit_i = 0;
+  orbit_raan = 0;
+  orbit_peri = pi/2;
+  orbit_ta = 0;
+  orbit_E = 0;
+  orbit_M = 0;
+  orbit_rmag = 2.5;
+  orbit_p = 10;
+  orbit_mu = 400; //supporting vars
+  orbit_rx = 0;
+  orbit_ry = 0;
+  orbit_rz = 0;
+  elevation = 0;
+  azimuth = 0;
+  lastOrbitUpdateTime = 0; 
+  orbitUpdatePeriod = 100; //ms
+  timeWarp = 1;
+  InitOrbit();  
+}
+
+void loop() {
+
+  if (Serial.available()) {
+    serialIn = Serial.readString();
+    firstChar = serialIn.charAt(0);
+
+    switch (firstChar) {
+      case 'd':  
+        disable = serialIn.substring(1).toInt();
+        Serial.println("D"+String(disable));
+        break;
+      case 'm':
+        mode = serialIn.substring(1).toInt();
+        Serial.print("M");
+        Serial.println(mode);
+        break;
+      case 'r':
+        raanSetpoint = serialIn.substring(1).toDouble();
+        orbit_raan = raanSetpoint;
+        InitOrbit();
+        break;
+      case 'i':
+        incSetpoint = serialIn.substring(1).toDouble();
+        orbit_i = incSetpoint;
+        InitOrbit();
+        break;  
+      case 's': //Servo power command sent
+        servoCommandedID = String(serialIn[1]).toInt(); //1-12
+        servoCommandedPWM = serialIn.substring(2).toInt();
+        if (mode ==3){HandleServosManual(servoCommandedID, servoCommandedPWM);}
+        break; 
+      case 'l': //laser power command sent
+        laserCommanded = String(serialIn[1]).toInt();
+        laserPower = serialIn.substring(2).toInt();
+          if (mode == 3){HandleLaserRelays(laserCommanded, laserPower); }
+          else {HandleLaserRelays(laserCommanded, 0);}        
+        break; 
+      case 'a':
+        orbit_a = serialIn.substring(1).toDouble();
+        InitOrbit();
+        Serial.print("A");
+        Serial.println(orbit_a);
+        break;    
+      case 'e':
+        orbit_e = serialIn.substring(1).toDouble();
+        InitOrbit();
+        Serial.print("E");
+        Serial.println(orbit_e);
+        break;
+      case 't':
+        timeWarp = serialIn.substring(1).toDouble();
+        Serial.print("T");
+        Serial.println(timeWarp);
+        InitOrbit();
+        break;        
+    }
+  }
+  
+  HandleButton();         //handles the e-stop button
+  digitalWrite(powerRelay, disable);  
+  HandleEncoders();       //handles the two encoders, calculates RAAN and Inc 
+  switch(mode){
+    case 0: // Calibration
+      Serial.println("M0"); delay(20);
+      if (!raanCalibrated){
+        Serial.println("C0"); delay(20);
+        CalibrateRaan();        
+      }
+      else if (!incCalibrated){
+        Serial.println("C1"); 
+        CalibrateInc();
+      }
+      else {
+        Serial.println("C2"); delay(20);
+        Serial.println("M1");
+        mode = 1;
+      }
+      break;
+    case 1: // Position Control & Show Orbit
+      HandlePID(); 
+      break;
+    case 2:
+      Zero();
+      break;
+    case 3: // Servo & Laser Manual
+      raanSetpoint = 0;
+      incSetpoint = 0;
+      HandlePID();
+      break;
+    case 4:
+      HandleServosManual(0, map(analogRead(A2), 0, 870, 150, 650));
+      HandleServosManual(1, map(analogRead(A3), 0, 870, 150, 650));
+      // Serial.print(analogRead(A2));
+      // Serial.print(" ");
+      // Serial.println(analogRead(A3));
+      break;
+    case 5: 
+      HandleOrbit(); 
+      break;
+  }
+
+//Setting Motor directions by calling setDir(motorID, dir) function
+// CONSIDER MOVING THIS INSIDE HANDLEPID()
+  setDir(1, -1*sign(raanSpeed));
+  setDir(2, -1*sign(incSpeed));
+  analogWrite(motor1PWM, min(abs(raanSpeed),100));
+  analogWrite(motor2PWM, min(abs(incSpeed), 200));
+  
+}
+
+void setDir(int motor, int dir){ //Sets motor directions
+
+  if (motor == 1){
+    if (dir == -1){
+      digitalWrite(motor1Dir2, HIGH);
+      digitalWrite(motor1Dir1, LOW);     
+    }
+    else if (dir == 1){
+      digitalWrite(motor1Dir2, LOW);
+      digitalWrite(motor1Dir1, HIGH);
+    }
+  } 
+  else if (motor == 2){
+    if (dir == -1){
+      digitalWrite(motor2Dir2, HIGH);
+      digitalWrite(motor2Dir1, LOW);     
+    }
+    else if (dir == 1){
+      digitalWrite(motor2Dir2, LOW);
+      digitalWrite(motor2Dir1, HIGH);
+    }
+  }
+}
+int sign(double input){ // Custom function for determining the sign of a value (-1 for negative, 1 for positive, 0 for 0
+
+  if (input > 0){return 1;}
+  else if (input < 0){return -1;}
+  else {return 0;}
+}
+void HandleButton(void){
+
+  int reading = digitalRead(eStop); //disableButtonState is 1 if the button is pressed, 0 if not
+  if(reading != lastDisableButtonState){ //true if the button state has just changed
+    lastDebounceTime = millis();
+  }
+  if ((millis() - lastDebounceTime) > debounceDelay){ //if the state has been the same for more than 5ms
+    if (reading != disableButtonState){
+        disableButtonState = reading; 
+        if (disableButtonState == 1){
+          disable = !disable;
+          Serial.println("D"+String(disable)); //send updated disable status 
+        }
+      }
+    }
+  lastDisableButtonState = reading;
+}
+void HandleEncoders(void){
+  
+  currentRaan = raanEnc.read();
+  currentRaan /= 8688; //steps per rev 8719
+  currentRaan *= 360; //counts per rev
+  
+  currentInc = incEnc.read();
+  currentInc /= 11837;//steps per rev
+  currentInc *= 360;//counts per rev
+  currentInc -= currentRaan;
+
+  currentIncHall = analogRead(incHallPin);
+
+  if (currentRaan != oldRaan) {
+    Serial.print("R");
+    Serial.println(currentRaan);
+    oldRaan = currentRaan;
+  }
+  if (currentInc != oldInc) {
+    Serial.print("I");
+    Serial.println(currentInc);
+    oldInc = currentInc;
+  }
+  /*
+  if (currentIncHall != oldIncHall) {
+    Serial.print("H");
+    Serial.println(currentIncHall);
+    oldIncHall = currentIncHall;
+  }
+  */
+}
+void HandlePID(void){
+
+  raanError = raanSetpoint - currentRaan;
+  raanErrorDer = (raanError - raanErrorPrev) / (millis() - oldTime);
+  
+  if (abs(raanError) < raanTol){      //error margin. If within this margin, it's "close enough"
+    raanError = 0;
+    raanErrorInt = 0;
+    raanMotorMin = 0;
+    raanErrorDer = 0;
+  } 
+  else if (abs(raanError) < 5){
+    raanErrorInt += raanError;
+    raanMotorMin = 18;
+  } 
+  else{
+    raanErrorInt = 0;
+    raanMotorMin = 15;
+  }
+  raanSpeed = (int) (raanKp*raanError + raanKi*raanErrorInt + raanKd*raanErrorDer + raanMotorMin*sign(raanError));
+
+  incError = incSetpoint - currentInc;
+  incErrorDer = (incError - incErrorPrev)/(millis() - oldTime); //change from milliseconds to seconds
+  if (abs(incError) < incTol){      //error margin. If within this margin, it's "close enough"
+    incError = 0;
+    incErrorInt = 0;
+    incMotorMin = 0;
+    incErrorDer = 0;
+  } 
+  else if (abs(incError) < 5){
+    incErrorInt += incError;
+    incMotorMin = 15;
+  } 
+  else{
+    incMotorMin = 15;
+    incErrorInt = 0;
+  }
+  incSpeed = (int) (incKp*incError + incKi*incErrorInt + incKd*incErrorDer + incMotorMin*sign(incError));
+  oldTime = millis(); //change from milliseconds to seconds
+}
+void CalibrateRaan(void){
+  //Serial.println(digitalRead(raanGate));
+  if (digitalRead(raanGate) == 1){
+    raanSpeed = 80;
+  }
+  else{
+    raanEnc.write(0*(8719/360)); // 0 = degrees offset
+    raanCalibrated = 1;  
+  } 
+}
+void CalibrateInc(void){
+  raanSetpoint = 0;
+  incSetpoint = 999;
+  //raanError = raanSetpoint - currentRaan;
+  //if (abs(raanError) > raanTol){
+  HandlePID();    
+  //}
+  if (currentIncHall < 700){
+    incSpeed = 80;
+  }
+  else{
+    incEnc.write(0);
+    incCalibrated = 1;
+    incSetpoint = 0;
+  }  
+}
+void Zero(void){
+  raanEnc.write(0);
+  incEnc.write(0);
+  raanSetpoint = 0;
+  incSetpoint = 0;
+  //mode = 1;
+  raanCalibrated = 0;
+  incCalibrated = 0;
+  //Serial.println("M1");
+}
+void HandleLaserRelays(int laserCommanded, int laserPower){
+  //activate (or deactivate) only the commanded laser, assumes pins are in ascending order 
+  digitalWrite(laser1Relay + 2 - (2*laserCommanded), !laserPower);
+  Serial.print("L");
+  Serial.print(laserCommanded);
+  Serial.println(laserPower);
+}
+void HandleServosManual(int servoCommandedID, int servoCommandedPWM){
+  servos.setPWM(servoCommandedID, 0, servoCommandedPWM);
+  Serial.print("S");
+  Serial.print(servoCommandedID);
+  Serial.println(servoCommandedPWM);
+}
+double MeanAnomalyToTrueAnomaly(double M, double ecc){
+  double E;
+  if (M < pi){
+    E = M + (ecc*1.2*sin(M))/(M+0.07); //this is an analytical approximation I made up to avoid using iterations
+  }
+  else{
+    M = 2*pi - M;
+    E = M + (ecc*1.2*sin(M))/(M+0.07);
+    E = 2*pi - E;
+  }
+  double ta = acos((cos(E)-ecc)/(1-ecc*cos(E)));
+  if (E > pi){ta = 2*pi - ta;}
+  return ta;
+  
+}
+void COEtoCart(){
+  //double p, r;
+  if (orbit_e<.01){
+    orbit_p = orbit_a;
+    orbit_rmag = orbit_p;
+  }
+  else{
+    orbit_p = orbit_a*(1-pow(orbit_e,2));
+    orbit_rmag = orbit_p/(1+orbit_e*cos(orbit_ta));
+  }
+
+  orbit_rx = orbit_rmag*(cos(orbit_raan)*cos(orbit_ta+orbit_peri) - sin(orbit_raan)*cos(orbit_i)*sin(orbit_ta+orbit_peri));
+  orbit_ry = orbit_rmag*(sin(orbit_raan)*cos(orbit_peri+orbit_ta) + cos(orbit_raan)*cos(orbit_i)*sin(orbit_peri+orbit_ta));
+  orbit_rz = orbit_rmag*(sin(orbit_i)*sin(orbit_ta+orbit_peri));
+}
+void InitOrbit(){
+  orbit_E = 2*atan(tan(orbit_ta/2)*sqrt((1-orbit_e)/(1+orbit_e)));
+  orbit_M = orbit_E - orbit_e*sin(orbit_E);
+  orbit_n = sqrt(orbit_mu/pow(orbit_a,3));
+}
+void HandleOrbit(){
+  
+  if (millis() - lastOrbitUpdateTime > orbitUpdatePeriod){
+    orbit_M = timeWarp*orbit_n*((double)millis())/1000;
+    orbit_M = (double)fmod((float)orbit_M,2*pi);
+    orbit_ta = MeanAnomalyToTrueAnomaly(orbit_M, orbit_e);
+    Serial.print("F");
+    Serial.println(orbit_ta*180/pi);
+    COEtoCart();
+    Cart2Spherical();
+    Spherical2PWM();
+    // Serial.print(orbit_rx); Serial.print(" "); Serial.print(orbit_ry); Serial.print(" "); Serial.print(orbit_rz); 
+    // Serial.println("");
+    lastOrbitUpdateTime = millis();
+  }
+}
+
+void Cart2Spherical(){
+  double servoToSatX = orbit_rx - .01;
+  double servoToSatY = orbit_ry - 15;
+  double servoToSatZ = orbit_rz - 14.5;
+
+//phi (from +Z axis donward)
+  elevation = acos(servoToSatZ/(sqrt(pow(servoToSatX,2) + pow(servoToSatY,2) +pow(servoToSatZ,2))));
+  elevation *= 180/(pi);
+  //elevation for Servo pair 1 is defiend as angle downward from the horizontal
+  
+  //theta (from +x axis to +y axis)
+  azimuth = sign(servoToSatY)*acos(servoToSatX/(pow(servoToSatX,2) + pow(servoToSatY,2)));
+  azimuth = atan2(servoToSatY, servoToSatX);
+  azimuth *= 180/(pi);
+  // Serial.print(servoToSatX);
+  // Serial.print(" ");
+  // Serial.print(servoToSatY);
+  // Serial.print(" ");
+  // Serial.println(servoToSatZ);
+  // Serial.print(azimuth+90);
+  // Serial.print(" ");
+  // Serial.println(elevation);
+}
+void Spherical2PWM(){
+ 
+  
+  
+
+  // servos.setPWM(0, 0, 500 - 2.33*elevation);
+  // servos.setPWM(1, 0, 800 - 10*azimuth);
+  // Serial.print("S");
+  // Serial.print(0);
+  elevation -= 90;
+  azimuth+= 90;
+  //if (mode == 5){
+  servos.setPWM(0, 0, 490 - 2.33*elevation); //490 elevation is straight down
+  servos.setPWM(1, 0, 285 - 2.33*azimuth); //285 az is straight across, toward the frame axis
+  // Serial.println(500 - .5*elevation);
+  //}
+
+}
